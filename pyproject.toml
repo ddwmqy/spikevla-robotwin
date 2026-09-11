@@ -65,6 +65,7 @@ include = [
   "deployment*",
   "experiments*",
   "starVLA*",
+  "third_party*",
   "turbovla*",
   "vla_adapter*",
 ]

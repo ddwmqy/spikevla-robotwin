@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -28,6 +29,10 @@ class TurboVLADefaultConfig:
     name: str = "TurboVLA"
     text: dict = field(
         default_factory=lambda: {
+            # v4 port: encoder_type/mask_version/timesteps default to official behavior.
+            "encoder_type": "bert",
+            "mask_version": "legacy",
+            "timesteps": 1,
             "bert_path": "/path/to/bert-base-uncased",
             "max_text_len": 256,
             "sub_sentence_present": True,
@@ -38,7 +43,15 @@ class TurboVLADefaultConfig:
     )
     vision: dict = field(
         default_factory=lambda: {
+            # v4 port: encoder_type="sdtv3_19m" switches to the SDT-V3 SNN backbone;
+            # model_path then points at the SDT-V3 weights and processor_path must
+            # point at an HF image processor directory (v3 reused DINOv3 @224px).
+            "encoder_type": "dinov3",
             "model_path": "/path/to/dinov3",
+            "model_source_path": "",
+            "pretrained_checkpoint": "",
+            "processor_path": "",
+            "output_grid_size": 14,
             "image_size": 224,
             "num_views": 3,
             "local_files_only": True,
@@ -63,6 +76,10 @@ class TurboVLADefaultConfig:
             "residual_style": "pre_norm",
             "attention_backend": "sdpa",
             "compute_precision": "bf16_autocast",
+            # v4 port: spike cross-attention switch (official default = ann).
+            "cross_attention_type": "ann",
+            "cross_timesteps": 4,
+            "cross_gradient_checkpointing": True,
         }
     )
     initialization: dict = field(
@@ -99,8 +116,17 @@ class TurboVLAFramework(baseframework):
         self.config = merge_framework_config(TurboVLADefaultConfig, config)
         fw = self.config.framework
         self.model = build_turbovla(self._core_config(fw))
+        # v4 port: SDT-V3 ships no HF processor; preprocess via vision.processor_path
+        # (v3 LIBERO reused the DINOv3 processor for SDT-V3 at 224px).
+        vision_encoder_type = str(fw.vision.get("encoder_type", "dinov3"))
+        processor_path = fw.vision.get("processor_path") or fw.vision.model_path
+        if vision_encoder_type != "dinov3" and not Path(str(processor_path)).is_dir():
+            raise ValueError(
+                "vision.encoder_type='sdtv3_19m' requires vision.processor_path pointing at "
+                "an HF image processor directory (v3 used the DINOv3 processor at 224px)"
+            )
         self.image_processor = AutoImageProcessor.from_pretrained(
-            fw.vision.model_path,
+            processor_path,
             local_files_only=fw.vision.local_files_only,
         )
         self.image_size = int(fw.vision.image_size)
@@ -115,8 +141,11 @@ class TurboVLAFramework(baseframework):
     @staticmethod
     def _core_config(fw) -> TurboVLAConfig:
         return TurboVLAConfig(
+            text_mask_version=str(fw.text.get("mask_version", "legacy")),
             text=TextEncoderConfig(
+                encoder_type=str(fw.text.get("encoder_type", "bert")),
                 model_name_or_path=fw.text.bert_path,
+                timesteps=int(fw.text.get("timesteps", 1)),
                 max_length=int(fw.text.max_text_len),
                 padding_length=None,
                 sub_sentence_present=bool(fw.text.sub_sentence_present),
@@ -127,15 +156,19 @@ class TurboVLAFramework(baseframework):
                 attention_implementation=fw.text.get("attn_implementation"),
             ),
             vision=VisionEncoderConfig(
+                encoder_type=str(fw.vision.get("encoder_type", "dinov3")),
                 model_name_or_path=fw.vision.model_path,
                 image_size=int(fw.vision.image_size),
                 num_views=int(fw.vision.num_views),
+                pretrained_checkpoint=fw.vision.get("pretrained_checkpoint") or None,
+                model_source_path=fw.vision.get("model_source_path") or None,
+                output_grid_size=int(fw.vision.get("output_grid_size", 14)),
                 position_embedding="learned_patch",
                 encode_views_separately=False,
                 frozen=bool(fw.vision.freeze_vision_encoder),
                 local_files_only=bool(fw.vision.local_files_only),
                 attention_implementation=fw.vision.get("attn_implementation"),
-                compute_precision="bf16_autocast",
+                compute_precision=str(fw.vision.get("compute_precision", "bf16_autocast")),
                 position_init_std=float(fw.vision.position_init_std),
                 position_scale_init=float(fw.vision.position_scale_init),
                 dropout=float(fw.vision.dropout),
@@ -153,6 +186,9 @@ class TurboVLAFramework(baseframework):
                 residual_style=str(fw.interaction.residual_style),
                 attention_backend=str(fw.interaction.attention_backend),
                 compute_precision=str(fw.interaction.compute_precision),
+                cross_attention_type=str(fw.interaction.get("cross_attention_type", "ann")),
+                cross_timesteps=int(fw.interaction.get("cross_timesteps", 4)),
+                cross_gradient_checkpointing=bool(fw.interaction.get("cross_gradient_checkpointing", True)),
             ),
             action=ActionHeadConfig(
                 action_dim=int(fw.action.action_dim),
