@@ -1,0 +1,119 @@
+# A 臂:三组件 spike(SmoothSpike 文本 + SDT-V3 19M 视觉 + Spike2Max 融合)
+# 相对官方 clean50.yaml 的全部差异仅限 framework.text/vision/interaction 三个开关;
+# 训练超参、数据、动作头与官方逐字一致(PLAN_CN.md v7 §5.7)。
+# 注意:A 臂初始化为 from-scratch(load_pretrained: false)——官方 ckpt 的
+# bert./feat_map./transformer.* 与 spike 组件键名不匹配,热启动初始化待 §10-2 拍板。
+run_id: turbovla_robotwin_clean50_a
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: turbovla_robotwin
+is_debug: false
+version_id: "0.1"
+
+framework:
+  name: TurboVLA
+  text:
+    encoder_type: smoothspike_bert
+    mask_version: corrected
+    timesteps: 4            # 融合 ckpt 固定 T=4(门 #1 实测),不可改
+    bert_path: ${oc.env:SMOOTHSPIKE_MODEL_PATH}   # smoothspike-bert-base-fused 目录
+    max_text_len: 256
+    sub_sentence_present: true
+    local_files_only: true
+    freeze_text_encoder: true
+    attn_implementation: flash_attention_2
+  vision:
+    encoder_type: sdtv3_19m
+    model_path: ${oc.env:SDTV3_WEIGHTS_PATH}      # V3_19.0M_1x4.pth
+    processor_path: ${oc.env:SDTV3_PROCESSOR_PATH} # HF 图像处理器目录(224px,ViT-B 处理器即可)
+    output_grid_size: 14
+    model_source_path: ""
+    pretrained_checkpoint: ""
+    image_size: 224
+    num_views: 3
+    local_files_only: true
+    freeze_vision_encoder: false
+    attn_implementation: flash_attention_2
+    position_init_std: 0.01
+    position_scale_init: 0.01
+    dropout: 0.1
+  interaction:
+    cross_attention_type: spike_sdsa
+    cross_timesteps: 4
+    cross_gradient_checkpointing: true
+    hidden_dim: 256
+    nheads: 8
+    dim_feedforward: 2048
+    enhancer_inner_dim: 1024
+    num_layers: 6
+    text_dropout: 0.0
+    fusion_dropout: 0.0      # spike_sdsa 要求 0
+    fusion_droppath: 0.1
+    padding_strategy: zero_fill
+    residual_style: pre_norm
+    attention_backend: sdpa
+    compute_precision: bf16_autocast
+  initialization:
+    load_pretrained: false
+    load_bert: false
+    load_text_projection: false
+    load_interaction: false
+  action:
+    action_dim: 14
+    state_dim: 14
+    horizon: 50
+    num_layers: 3
+    dropout: 0.1
+    num_state_tokens: 2
+    state_hidden_dim: 256
+    mlp_hidden_dim: 512
+    loss_type: l1
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: ${oc.env:ROBOTWIN_DATA_ROOT}
+    data_mix: robotwin_clean_50
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 48
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    video_backend: pyav
+    num_workers: 8
+    prefetch_factor: 4
+    persistent_workers: true
+    pin_memory: true
+
+trainer:
+  use_deepspeed: true
+  max_train_steps: 100000
+  num_warmup_steps: 1000
+  save_interval: 5000
+  eval_interval: 1000
+  learning_rate:
+    base: 5.0e-05
+    text_encoder: 5.0e-05
+    vision_encoder: 5.0e-05
+    vision_language_interaction: 5.0e-05
+    vision_projection: 5.0e-05
+    action_head: 5.0e-05
+  lr_scheduler_type: warmup_constant_with_factor
+  scheduler_specific_kwargs:
+    warmup_start_factor: 0.0
+  freeze_modules: text_encoder.bert
+  max_grad_norm: 1.0
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-10
+  save_format: pt
+  ema_decay: 0.999
+  ema_device: cuda
+  logging_frequency: 50
