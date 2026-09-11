@@ -9,6 +9,7 @@ from torch import nn
 from transformers import AutoModel, AutoTokenizer
 
 from ..text.bert import BertModelWarper, generate_masks_with_special_tokens
+from ..text.smoothspike import load_smoothspike_model
 from .configuration import TextEncoderConfig
 
 
@@ -43,18 +44,28 @@ def _load_pretrained_model(config: TextEncoderConfig):
 
 
 class TurboVLATextEncoder(nn.Module):
-    """Online BERT encoder used by every TurboVLA forward pass."""
+    """Online BERT or SmoothSpike-BERT encoder used by every TurboVLA forward pass."""
 
-    def __init__(self, config: TextEncoderConfig, hidden_dim: int) -> None:
+    def __init__(
+        self, config: TextEncoderConfig, hidden_dim: int, text_mask_version: str = "legacy"
+    ) -> None:
         super().__init__()
         self.config = config
+        if text_mask_version not in {"legacy", "corrected"}:
+            raise ValueError("text_mask_version must be legacy or corrected")
+        self.text_mask_version = text_mask_version
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model_name_or_path,
             local_files_only=config.local_files_only,
             use_fast=True,
         )
-        bert = _load_pretrained_model(config)
-        self.bert = BertModelWarper(bert_model=bert)
+        if config.encoder_type == "bert":
+            bert = _load_pretrained_model(config)
+            self.bert = BertModelWarper(bert_model=bert)
+        elif config.encoder_type == "smoothspike_bert":
+            self.bert = load_smoothspike_model(config.model_name_or_path, config.timesteps)
+        else:
+            raise ValueError(f"unsupported text encoder type: {config.encoder_type!r}")
         self.text_projection = nn.Linear(self.bert.config.hidden_size, hidden_dim, bias=True)
         nn.init.xavier_uniform_(self.text_projection.weight)
         nn.init.constant_(self.text_projection.bias, 0.0)
@@ -90,6 +101,7 @@ class TurboVLATextEncoder(nn.Module):
             tokenized,
             self.special_tokens,
             self.tokenizer,
+            mask_version=self.text_mask_version,
         )
         return tokenized, text_self_attention_masks, position_ids
 

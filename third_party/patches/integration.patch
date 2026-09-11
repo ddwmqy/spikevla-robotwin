@@ -1,0 +1,130 @@
+--- a/third_party/SmoothSpike/spikingbert_rot_inf.py
++++ b/third_party/SmoothSpike/spikingbert_rot_inf.py
+@@ -48,7 +48,7 @@
+ from transformers.models.bert.configuration_bert import BertConfig
+ from spikingjelly.activation_based import neuron
+ from spikingjelly.activation_based import functional
+-from hadamard_utils import random_hadamard_matrix
++from .hadamard_utils import random_hadamard_matrix
+ 
+ 
+ def msign(G, steps=5, eps=1e-7):
+@@ -79,7 +79,9 @@
+ 
+ 
+ def _get_runtime_device() -> torch.device:
+-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    # Construct checkpoint-replaced rotations on CPU before DDP device placement.
++    # The complete model is moved to its rank-local device after strict loading.
++    return torch.device("cpu")
+ 
+ 
+ def _get_lif_backend() -> str:
+@@ -979,6 +981,7 @@
+         self.config = config
+         
+         self.H1 = nn.Parameter(random_hadamard_matrix(config.hidden_size, device=_RUNTIME_DEVICE).to(torch.float32))
++        self.register_buffer("_frozen_H1_sign", None, persistent=False)
+         
+         self.embeddings = BertEmbeddings(config)
+         self.encoder = BertEncoder(config)
+@@ -1012,6 +1015,20 @@
+         """
+         for layer, heads in heads_to_prune.items():
+             self.encoder.layer[layer].attention.prune_heads(heads)
++
++    def _get_H1_sign(self) -> torch.Tensor:
++        if self.H1.requires_grad:
++            return msign(self.H1)
++        cached = self._frozen_H1_sign
++        if (
++            cached is None
++            or cached.device != self.H1.device
++            or cached.dtype != self.H1.dtype
++            or cached.shape != self.H1.shape
++        ):
++            cached = msign(self.H1.detach())
++            self._frozen_H1_sign = cached
++        return cached
+ 
+     @auto_docstring
+     def forward(
+@@ -1074,7 +1091,7 @@
+             else:
+                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+ 
+-        H1_sign = msign(self.H1)
++        H1_sign = self._get_H1_sign()
+ 
+         embedding_output = self.embeddings(
+             input_ids=input_ids,
+@@ -1140,8 +1157,19 @@
+         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
+         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+ 
+-        ### update extended_attention_mask during training here!!!
+-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
++        # SmoothSpike eager attention uses a multiplicative 0/1 mask. TurboVLA
++        # supplies either [B, L] or GroundingDINO's [B, L, L] sub-sentence mask.
++        if attention_mask.dim() == 2:
++            extended_attention_mask = attention_mask[:, None, None, :]
++        elif attention_mask.dim() == 3:
++            extended_attention_mask = attention_mask[:, None, :, :]
++        elif attention_mask.dim() == 4:
++            extended_attention_mask = attention_mask
++        else:
++            raise ValueError(
++                f"attention_mask must have 2, 3, or 4 dimensions, got {attention_mask.dim()}"
++            )
++        extended_attention_mask = extended_attention_mask.to(dtype=embedding_output.dtype)
+         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+         encoder_outputs = self.encoder(
+             embedding_output,
+--- a/third_party/SmoothSpike/hadamard_utils.py
++++ b/third_party/SmoothSpike/hadamard_utils.py
+@@ -10,7 +10,7 @@
+ # Adapted from https://github.com/Cornell-RelaxML/quip-sharp/blob/main/lib/utils/matmul_had.py
+ 
+ import torch
+-from utils import HadamardTransform
++from .utils import HadamardTransform
+ 
+ 
+ def get_hadK(n, transpose=False):
+--- a/third_party/SmoothSpike/utils.py
++++ b/third_party/SmoothSpike/utils.py
+@@ -15,7 +15,10 @@
+ 
+ import numpy as np
+ import torch
+-from fast_hadamard_transform import hadamard_transform
++try:
++    from fast_hadamard_transform import hadamard_transform
++except ImportError:
++    hadamard_transform = None
+ from torch.distributed.fsdp import (
+     FullStateDictConfig,
+ )
+@@ -41,10 +44,14 @@
+ 
+     @staticmethod
+     def forward(ctx, u):
++        if hadamard_transform is None:
++            raise RuntimeError("fast_hadamard_transform is required for CUDA HadamardTransform")
+         return hadamard_transform(u)
+ 
+     @staticmethod
+     def backward(ctx, grad):
++        if hadamard_transform is None:
++            raise RuntimeError("fast_hadamard_transform is required for CUDA HadamardTransform")
+         return hadamard_transform(grad)
+ 
+ 
+--- a/third_party/Spike-Driven-Transformer-V3/SDT_V3/Classification/Model_Base/models.py
++++ b/third_party/Spike-Driven-Transformer-V3/SDT_V3/Classification/Model_Base/models.py
+@@ -1,5 +1,4 @@
+ import torch
+-import torchinfo
+ import torch.nn as nn
+ from timm.models.layers import to_2tuple, trunc_normal_, DropPath
+ from timm.models.registry import register_model

@@ -304,6 +304,9 @@ class BiAttentionBlock(nn.Module):
         cfg=None,
         residual_style="normalized",
         attention_backend="manual",
+        cross_attention_type="ann",
+        cross_timesteps=4,
+        cross_gradient_checkpointing=True,
     ):
         """
         Inputs:
@@ -318,13 +321,22 @@ class BiAttentionBlock(nn.Module):
         # pre layer norm
         self.layer_norm_v = nn.LayerNorm(v_dim)
         self.layer_norm_l = nn.LayerNorm(l_dim)
-        self.attn = BiMultiHeadAttention(
+        if cross_attention_type == "spike_sdsa":
+            from .spike_fusion import SpikeBiMultiHeadAttention
+            attention_cls = SpikeBiMultiHeadAttention
+            extra = dict(timesteps=cross_timesteps, gradient_checkpointing=cross_gradient_checkpointing)
+        elif cross_attention_type == "ann":
+            attention_cls, extra = BiMultiHeadAttention, {}
+        else:
+            raise ValueError(f"unknown cross_attention_type: {cross_attention_type}")
+        self.attn = attention_cls(
             v_dim=v_dim,
             l_dim=l_dim,
             embed_dim=embed_dim,
             num_heads=num_heads,
             dropout=dropout,
             attention_backend=attention_backend,
+            **extra,
         )
 
         # add layer scale for training stability

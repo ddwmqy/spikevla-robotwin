@@ -79,6 +79,7 @@ class TransformerEncoderLayer(nn.Module):
         dropout=0.1,
         activation="relu",
         normalize_before=False,
+        text_mask_version="legacy",
     ):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
@@ -95,6 +96,9 @@ class TransformerEncoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
         self.nhead = nhead
+        if text_mask_version not in {"legacy", "corrected"}:
+            raise ValueError("text_mask_version must be legacy or corrected")
+        self.text_mask_version = text_mask_version
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -107,9 +111,12 @@ class TransformerEncoderLayer(nn.Module):
         pos: Optional[Tensor] = None,
     ):
         # repeat attn mask
-        if src_mask.dim() == 3 and src_mask.shape[0] == src.shape[1]:
-            # bs, num_q, num_k
-            src_mask = src_mask.repeat(self.nhead, 1, 1)
+        if src_mask is not None and src_mask.dim() == 3 and src_mask.shape[0] == src.shape[1]:
+            if self.text_mask_version == "legacy":
+                src_mask = src_mask.repeat(self.nhead, 1, 1)
+            else:
+                # MultiheadAttention flattens [batch, head], not [head, batch].
+                src_mask = src_mask.repeat_interleave(self.nhead, dim=0)
 
         q = k = self.with_pos_embed(src, pos)
 

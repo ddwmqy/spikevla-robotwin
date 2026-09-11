@@ -18,7 +18,7 @@ from .configuration import (
     VisionEncoderConfig,
 )
 from .text_encoder import TurboVLATextEncoder
-from .vision_encoder import DINOv3VisionEncoder
+from .vision_encoder import build_vision_encoder
 
 
 class VisionProjection(nn.Module):
@@ -39,13 +39,14 @@ class VisionProjection(nn.Module):
 
 
 class VisionLanguageInteraction(nn.Module):
-    def __init__(self, config: InteractionConfig) -> None:
+    def __init__(self, config: InteractionConfig, text_mask_version: str = "corrected") -> None:
         super().__init__()
         text_layer = TransformerEncoderLayer(
             d_model=config.hidden_dim,
             nhead=max(1, config.nheads // 2),
             dim_feedforward=config.enhancer_inner_dim,
             dropout=config.text_dropout,
+            text_mask_version=text_mask_version,
         )
         fusion_layer = BiAttentionBlock(
             v_dim=config.hidden_dim,
@@ -56,6 +57,9 @@ class VisionLanguageInteraction(nn.Module):
             drop_path=config.fusion_droppath,
             residual_style=config.residual_style,
             attention_backend=config.attention_backend,
+            cross_attention_type=config.cross_attention_type,
+            cross_timesteps=config.cross_timesteps,
+            cross_gradient_checkpointing=config.cross_gradient_checkpointing,
         )
         self.text_layers = _get_clones(text_layer, config.num_layers)
         self.fusion_layers = _get_clones(fusion_layer, config.num_layers)
@@ -103,8 +107,10 @@ class TurboVLA(nn.Module):
         self.state_dim = int(config.action.state_dim)
         self.num_views = int(config.vision.num_views)
 
-        self.text_encoder = TurboVLATextEncoder(config.text, hidden_dim=hidden_dim)
-        self.vision_encoder = DINOv3VisionEncoder(config.vision)
+        self.text_encoder = TurboVLATextEncoder(
+            config.text, hidden_dim=hidden_dim, text_mask_version=config.sentence_mask_version
+        )
+        self.vision_encoder = build_vision_encoder(config.vision)
         self.vision_projection = VisionProjection(
             in_dim=self.vision_encoder.hidden_size,
             out_dim=hidden_dim,
@@ -127,7 +133,9 @@ class TurboVLA(nn.Module):
             self.register_parameter("patch_position_scale", None)
         nn.init.trunc_normal_(self.view_embedding, std=0.02)
 
-        self.vision_language_interaction = VisionLanguageInteraction(config.interaction)
+        self.vision_language_interaction = VisionLanguageInteraction(
+            config.interaction, text_mask_version=config.head_mask_version
+        )
         self.action_head = TurboVLAActionHead(
             config=config.action,
             hidden_dim=hidden_dim,
@@ -137,9 +145,10 @@ class TurboVLA(nn.Module):
 
     def _normalize_samples(self, samples: torch.Tensor | Mapping[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(samples, Mapping):
-            if "dinov3" not in samples:
-                raise ValueError("samples mapping must contain 'dinov3'")
-            pixel_values = samples["dinov3"]
+            key = "pixel_values" if "pixel_values" in samples else "dinov3"
+            if key not in samples:
+                raise ValueError("samples mapping must contain 'pixel_values' (or legacy 'dinov3')")
+            pixel_values = samples[key]
         else:
             pixel_values = samples
         if pixel_values.ndim == 6:
@@ -172,7 +181,9 @@ class TurboVLA(nn.Module):
         self,
         instructions: Sequence[str],
         samples: torch.Tensor | Mapping[str, torch.Tensor],
-    ) -> torch.Tensor:
+        return_visual_tokens: bool = False,
+        return_distillation_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, Any]:
         pixel_values = self._normalize_samples(samples)
         device = pixel_values.device
         precision_context = nullcontext()
@@ -185,24 +196,51 @@ class TurboVLA(nn.Module):
             )
             if text_tokens.shape[0] != pixel_values.shape[0]:
                 raise ValueError("instruction batch size does not match image batch size")
+            projected_text_tokens = text_tokens
             visual_tokens = self.encode_vision(pixel_values)
+            projected_visual_tokens = visual_tokens
             visual_tokens, text_tokens = self.vision_language_interaction(
                 visual_tokens=visual_tokens,
                 text_tokens=text_tokens,
                 text_key_padding_mask=text_key_padding_mask,
                 text_self_attention_masks=text_self_attention_masks,
             )
-            return torch.cat([visual_tokens, text_tokens], dim=1)
+            condition = torch.cat([visual_tokens, text_tokens], dim=1)
+            if return_distillation_features:
+                return condition, {
+                    "visual": projected_visual_tokens,
+                    "text": projected_text_tokens,
+                    "text_valid": ~text_key_padding_mask,
+                }
+            if return_visual_tokens:
+                return condition, projected_visual_tokens
+            return condition
 
     def forward(
         self,
         instructions: Sequence[str],
         samples: torch.Tensor | Mapping[str, torch.Tensor],
         state: torch.Tensor,
-    ) -> torch.Tensor:
-        condition = self.encode_condition(instructions, samples)
+        return_visual_tokens: bool = False,
+        return_distillation_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+        encoded = self.encode_condition(
+            instructions, samples, return_visual_tokens=return_visual_tokens,
+            return_distillation_features=return_distillation_features,
+        )
+        if return_distillation_features:
+            condition, features = encoded
+        elif return_visual_tokens:
+            condition, visual_tokens = encoded
+        else:
+            condition = encoded
         action_dtype = self.action_head.decoder.action_queries.weight.dtype
-        return self.action_head(condition.to(dtype=action_dtype), state.to(dtype=action_dtype))
+        actions = self.action_head(condition.to(dtype=action_dtype), state.to(dtype=action_dtype))
+        if return_distillation_features:
+            return actions, features
+        if return_visual_tokens:
+            return actions, visual_tokens
+        return actions
 
     # Transitional read-only names used only by legacy checkpoint initialization.
     @property
@@ -241,8 +279,16 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
         config = TurboVLAConfig.from_mapping(args)
     else:
         config = TurboVLAConfig(
+            text_mask_version=str(_arg(args, "text_mask_version", "legacy")),
+            text_sentence_mask_version=_arg(args, "text_sentence_mask_version", None),
+            text_head_mask_version=_arg(args, "text_head_mask_version", None),
             text=TextEncoderConfig(
-                model_name_or_path=_arg(args, "bert_path", "bert-base-uncased"),
+                encoder_type=str(_arg(args, "text_encoder_type", "bert")),
+                model_name_or_path=(
+                    _arg(args, "text_model_path", None)
+                    or _arg(args, "bert_path", "bert-base-uncased")
+                ),
+                timesteps=int(_arg(args, "text_timesteps", 1)),
                 max_length=int(_arg(args, "max_text_len", 256)),
                 padding_length=_arg(args, "text_padding_length", None),
                 padding_length_by_instruction=dict(_arg(args, "text_padding_length_by_instruction", {})),
@@ -254,7 +300,10 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 attention_implementation=_arg(args, "text_attention_implementation", None),
             ),
             vision=VisionEncoderConfig(
-                model_name_or_path=_arg(args, "dinov3_path", _arg(args, "LOCAL_DINOV3_PATH", "")),
+                encoder_type=str(_arg(args, "vision_encoder_type", "dinov3")),
+                model_name_or_path=_arg(
+                    args, "vision_model_path", _arg(args, "dinov3_path", _arg(args, "LOCAL_DINOV3_PATH", ""))
+                ),
                 image_size=int(_arg(args, "image_size", _arg(args, "expected_image_size", 256))),
                 num_views=int(_arg(args, "num_views", 2)),
                 position_embedding=str(_arg(args, "position_embedding", "view")),
@@ -264,6 +313,9 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 attention_implementation=_arg(args, "vision_attention_implementation", None),
                 compute_precision=str(_arg(args, "dinov3_precision", "bf16_autocast")),
                 dropout=float(_arg(args, "vision_dropout", 0.1)),
+                pretrained_checkpoint=_arg(args, "vision_pretrained_checkpoint", None),
+                model_source_path=_arg(args, "vision_model_source_path", None),
+                output_grid_size=int(_arg(args, "vision_output_grid_size", 14)),
             ),
             interaction=InteractionConfig(
                 hidden_dim=int(_arg(args, "hidden_dim", 256)),
@@ -278,6 +330,9 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 residual_style=str(_arg(args, "residual_style", "normalized")),
                 attention_backend=str(_arg(args, "attention_backend", "manual")),
                 compute_precision=str(_arg(args, "interaction_precision", "fp32")),
+                cross_attention_type=str(_arg(args, "cross_attention_type", "ann")),
+                cross_timesteps=int(_arg(args, "cross_timesteps", 4)),
+                cross_gradient_checkpointing=bool(_arg(args, "cross_gradient_checkpointing", True)),
             ),
             action=ActionHeadConfig(
                 action_dim=int(_arg(args, "action_dim", 7)),

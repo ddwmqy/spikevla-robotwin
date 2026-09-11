@@ -174,7 +174,9 @@ class TextEncoderShell(nn.Module):
         return self.text_encoder(**kw)
 
 
-def generate_masks_with_special_tokens(tokenized, special_tokens_list, tokenizer):
+def generate_masks_with_special_tokens(
+    tokenized, special_tokens_list, tokenizer, *, mask_version="legacy"
+):
     """Generate attention mask between each pair of special tokens
     Args:
         input_ids (torch.Tensor): input ids. Shape: [bs, num_token]
@@ -182,6 +184,8 @@ def generate_masks_with_special_tokens(tokenized, special_tokens_list, tokenizer
     Returns:
         torch.Tensor: attention mask between each special tokens.
     """
+    if mask_version not in {"legacy", "corrected"}:
+        raise ValueError("mask_version must be legacy or corrected")
     input_ids = tokenized["input_ids"]
     bs, num_token = input_ids.shape
     # special_tokens_mask: bs, num_token. 1 for special tokens. 0 for normal tokens
@@ -200,7 +204,9 @@ def generate_masks_with_special_tokens(tokenized, special_tokens_list, tokenizer
     previous_col = 0
     for i in range(idxs.shape[0]):
         row, col = idxs[i]
-        if (col == 0) or (col == num_token - 1):
+        # A final [SEP] must close its sentence even when there is no padding.
+        # Retain the original rule only for previously trained checkpoints.
+        if (col == 0) or (mask_version == "legacy" and col == num_token - 1):
             attention_mask[row, col, col] = True
             position_ids[row, col] = 0
         else:

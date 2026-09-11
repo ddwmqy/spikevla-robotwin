@@ -46,3 +46,11 @@ tmp/
 # Browser QA artifacts.
 .playwright-cli/
 **/.playwright-cli/
+
+# ==== v4 port:上游运行时文件许可未定,不入库(沿袭 spike-turbovla 处理) ====
+# 环境内用 `python scripts/setup_third_party.py` 从上游 main 重建并应用 integration.patch。
+third_party/SmoothSpike/spikingbert_rot_inf.py
+third_party/SmoothSpike/hadamard_utils.py
+third_party/SmoothSpike/utils.py
+third_party/SmoothSpike/convertor.py
+third_party/Spike-Driven-Transformer-V3/SDT_V3/Classification/Model_Base/models.py
