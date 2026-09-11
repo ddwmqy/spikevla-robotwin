@@ -22,7 +22,7 @@ framework:
     sub_sentence_present: true
     local_files_only: true
     freeze_text_encoder: true
-    attn_implementation: flash_attention_2
+    attn_implementation: eager   # SmoothSpike 强制 eager spike-driven attention(configuration.py 校验)
   vision:
     encoder_type: sdtv3_19m
     model_path: ${oc.env:SDTV3_WEIGHTS_PATH}      # V3_19.0M_1x4.pth
@@ -34,7 +34,7 @@ framework:
     num_views: 3
     local_files_only: true
     freeze_vision_encoder: false
-    attn_implementation: flash_attention_2
+    attn_implementation: null    # SDT-V3 上游 backbone 自带注意力,不消费该开关
     position_init_std: 0.01
     position_scale_init: 0.01
     dropout: 0.1
