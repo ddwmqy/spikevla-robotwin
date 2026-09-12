@@ -349,7 +349,12 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
+            # §5.4 fix: read the sync flag once and gate step counting, eval and save on it
+            # together. `completed_steps` only changes on update steps, so without the guard
+            # a gate could fire once per micro-batch for the same step value (and fire at
+            # step 0), each eval consuming an extra training batch. At N=1 this is a no-op.
+            is_update_step = self.accelerator.sync_gradients
+            if is_update_step:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
@@ -361,14 +366,18 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            if is_update_step and self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if (
+                is_update_step
+                and self.completed_steps > 0
+                and self.completed_steps % self.config.trainer.save_interval == 0
+            ):
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -420,7 +429,14 @@ class VLATrainer(TrainerUtils):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
-            self.lr_scheduler.step()
+            # §5.4 fix: advance the LR scheduler only on real parameter updates.
+            # The scheduler is created outside `accelerator.prepare()`, so without this
+            # guard it advances once per micro-batch: with `gradient_accumulation_steps=N`
+            # a `num_warmup_steps=1000` warmup would span only 1000/N optimizer steps, and
+            # `_adjust_lr_scheduler_for_resume` would compound the drift. At N=1
+            # `sync_gradients` is always True, so official-config behavior is unchanged.
+            if self.accelerator.sync_gradients:
+                self.lr_scheduler.step()
 
         return {
             "action_dit_loss": action_loss.item(),
