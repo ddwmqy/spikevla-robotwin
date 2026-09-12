@@ -17,7 +17,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from omegaconf import OmegaConf
 
-from starVLA.model.framework.share_tools import dict_to_namespace, read_mode_config
+from starVLA.model.framework.share_tools import dict_to_namespace, load_checkpoint_file, read_mode_config
 from starVLA.model.tools import FRAMEWORK_REGISTRY, FrameworkTools, auto_get_trainable_modules
 from starVLA.training.trainer_utils import initialize_overwatch
 
@@ -254,12 +254,7 @@ class baseframework(PreTrainedModel):
         # set for action un-norm
         FrameworkModel.norm_stats = norm_stats
         # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
-        if pretrained_checkpoint.suffix == ".safetensors":
-            from safetensors.torch import load_file
-
-            model_state_dict = load_file(str(pretrained_checkpoint))
-        else:
-            model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
+        model_state_dict = load_checkpoint_file(pretrained_checkpoint)
         # logger.info(f"Loading model weights from `{pretrained_checkpoint}`")
         model_keys = set(FrameworkModel.state_dict().keys())
         checkpoint_keys = set(model_state_dict.keys())

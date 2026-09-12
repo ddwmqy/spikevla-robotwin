@@ -13,7 +13,7 @@ from transformers import AutoImageProcessor
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.base_framework import baseframework
-from starVLA.model.framework.share_tools import merge_framework_config
+from starVLA.model.framework.share_tools import load_checkpoint_file, merge_framework_config
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from turbovla.models import TurboVLAConfig, build_turbovla
 from turbovla.models.configuration import (
@@ -214,7 +214,7 @@ class TurboVLAFramework(baseframework):
         path = str(init_cfg.pretrained_ckpt)
         if not path:
             raise ValueError("framework.initialization.pretrained_ckpt is required")
-        source = self._checkpoint_state(torch.load(path, map_location="cpu"))
+        source = self._checkpoint_state(load_checkpoint_file(path))
         source = {(key[7:] if key.startswith("module.") else key): value for key, value in source.items()}
         mappings = []
         if init_cfg.load_bert:

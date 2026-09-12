@@ -1,9 +1,13 @@
-"""P0A gate #2b: full A-arm wrapper construction from clean50_a.yaml (CPU-capable).
+"""P0A gate #2b: full wrapper construction from an arm config (CPU-capable).
 
 End-to-end construction check: yaml → merge_framework_config → TurboVLAFramework →
-core A model (SmoothSpike text + SDT-V3 vision + Spike2Max fusion) → image processor
-→ predict_action. Catches config-validation bugs (e.g. wrong attn_implementation)
-that direct-config gates #1/#2 bypass, and verifies the env-var contract of the yaml.
+core model → image processor → predict_action. Catches config-validation bugs (e.g. a
+wrong attn_implementation for a spike encoder) that the direct-config gates bypass, and
+verifies the env-var contract of the yaml.
+
+Usage (env vars must be set as in the yaml; add load_pretrained=false if the init
+checkpoint is not available yet):
+    python scripts/gate2b_wrapper_build.py [config.yaml] [--set key=value ...]
 """
 import os
 import sys
@@ -23,20 +27,35 @@ from omegaconf import OmegaConf  # noqa: E402
 
 from starVLA.model.framework.VLM4A.TurboVLA import TurboVLAFramework  # noqa: E402
 
-for var in ("SMOOTHSPIKE_MODEL_PATH", "SDTV3_WEIGHTS_PATH", "SDTV3_PROCESSOR_PATH", "ROBOTWIN_DATA_ROOT"):
-    assert os.environ.get(var), f"gate #2b requires env var {var} (same contract as training launch)"
+argv = sys.argv[1:]
+positional = [a for a in argv if not a.startswith("--")]
+config_path = positional[0] if positional else f"{root}/experiments/robotwin/configs/clean50_a.yaml"
+sets = [a.lstrip("-") for a in argv if a.startswith("--")]
+print(f"config: {config_path}")
 
-with open(f"{root}/experiments/robotwin/configs/clean50_a.yaml") as fh:
+# env-var contract for whichever arm is being built (assert lazily per encoder type)
+with open(config_path) as fh:
     cfg = OmegaConf.create(yaml.safe_load(fh))
+if sets:
+    cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(sets))  # same typing rules as the trainer
+fw_cfg = cfg.framework
+
+needed = ["ROBOTWIN_DATA_ROOT"]
+if str(fw_cfg.text.get("encoder_type", "bert")) == "smoothspike_bert":
+    needed.append("SMOOTHSPIKE_MODEL_PATH")
+if str(fw_cfg.vision.get("encoder_type", "dinov3")) == "sdtv3_19m":
+    needed += ["SDTV3_WEIGHTS_PATH", "SDTV3_PROCESSOR_PATH"]
+else:
+    needed.append("DINOV3_MODEL_PATH")
+for var in needed:
+    assert os.environ.get(var), f"gate #2b requires env var {var} (same contract as training launch)"
 
 torch.manual_seed(0)
 fw = TurboVLAFramework(config=cfg)
 core = fw.model.config
-assert core.text.encoder_type == "smoothspike_bert" and core.text.timesteps == 4
-assert core.text_mask_version == "corrected" and core.text.attention_implementation == "eager"
-assert core.vision.encoder_type == "sdtv3_19m" and core.vision.num_views == 3
-assert core.interaction.cross_attention_type == "spike_sdsa" and core.interaction.cross_timesteps == 4
 print(f"framework built: {type(fw.model).__name__}; processor {type(fw.image_processor).__name__} @ {fw.image_processor.size}")
+print(f"text={core.text.encoder_type} T={core.text.timesteps} mask={core.text_mask_version} "
+      f"vision={core.vision.encoder_type} interaction={core.interaction.cross_attention_type}")
 print(f"views={fw.num_views} horizon={fw.action_horizon}")
 
 fw.eval()

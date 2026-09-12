@@ -16,6 +16,26 @@ def dict_to_namespace(value):
     return OmegaConf.create(value)
 
 
+def load_checkpoint_file(path, map_location="cpu"):
+    """Load a checkpoint from either a ``.safetensors`` or a torch-serialized file.
+
+    Two portability fixes over a bare ``torch.load``:
+    * ``.safetensors`` inputs are read with the safetensors loader (torch.load cannot read them);
+    * torch files are loaded with ``weights_only=False``. Since PyTorch 2.6 that is no longer the
+      default, and the released initialization checkpoints (e.g. ``groundingdino_swint_ogc.pth``)
+      store an ``argparse.Namespace`` alongside the weights, which the ``weights_only=True``
+      unpickler rejects. These paths only ever point at the user's own model assets.
+    """
+    path = Path(str(path))
+    if path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        return load_file(str(path), device=map_location)
+    import torch
+
+    return torch.load(str(path), map_location=map_location, weights_only=False)
+
+
 def merge_framework_config(default_config_cls, cfg):
     """Merge dataclass framework defaults with the user/checkpoint config."""
     defaults = OmegaConf.create(dataclasses.asdict(default_config_cls()))

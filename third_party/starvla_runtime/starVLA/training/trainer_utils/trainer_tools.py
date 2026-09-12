@@ -221,12 +221,9 @@ class TrainerUtils:
         if dist.get_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
-            if _is_safetensors_path(checkpoint_path):
-                from safetensors.torch import load_file
+            from starVLA.model.framework.share_tools import load_checkpoint_file
 
-                checkpoint = load_file(checkpoint_path)
-            else:
-                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            checkpoint = load_checkpoint_file(checkpoint_path)
         except Exception as e:
             raise RuntimeError(f"❌ loading checkpoint failed: {e}")
 
