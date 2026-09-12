@@ -14,6 +14,8 @@ pip install flash-attn                 # C1/B 的 vision.attn_implementation=fla
 环境变量(四臂共用,建议写进 `env.sh`):
 
 ```bash
+export STARVLA_PYTHON=/path/to/envs/turbovla-robotwin/bin/python   # train.sh 默认用系统 python!
+export ROBOTWIN_PYTHON="${STARVLA_PYTHON}"                          # 评测侧同理
 export ROBOTWIN_DATA_ROOT=/data/260010028/dwh_vla/v4_assets/robotwin_data/RoboTwin
 export DINOV3_MODEL_PATH=/data/260010028/dwh_vla/v4_assets/dinov3-vitl16-pretrain-lvd1689m
 export BERT_MODEL_PATH=/data/260010028/dwh_vla/v2_code_bundle_20260906/resources/pretrained/bert-base-uncased
@@ -26,6 +28,10 @@ export SDTV3_PROCESSOR_PATH=/data/260010028/dwh_vla/v2_code_bundle_20260906/reso
 `ROBOTWIN_DATA_ROOT` 必须指向**含 `Clean/` 子目录**的位置:HF 仓库 `StarVLA/RoboTwin-Clean`
 是平铺的任务目录,而训练注册表按 `Clean/<task_name>` 解析。本地已建软链
 `v4_assets/robotwin_data/RoboTwin/Clean -> ../StarVLA_RoboTwin_Clean`,共享卷上直接可用。
+
+`train.sh` 还会**强制检查四个文件存在**(`-f`),不区分该臂是否真的使用:即便是
+`load_pretrained: false` 的 A 臂,`TURBOVLA_INIT_CKPT` 也必须指向一个**真实文件**
+(不能是 `/dev/null` 这类字符设备)。
 
 ## 1. 四臂一览
 
@@ -68,9 +74,10 @@ bash scripts/robotwin/train.sh --trainer.save_interval 250 --trainer.eval_interv
 
 ## 3. 启动后必看的检查项
 
-- **B 臂**:日志里 `[TurboVLA] loaded N initialization tensors` —— `load_bert: false` 下 N 应只含
-  投影+交互(本地自测:393 个源张量里载入 182 个,文本主干 211 个张量逐位未动)。
-  可用 `python scripts/check_b_init_hash.py` 事后核验(需同一份 init ckpt)。
+- **B 臂**:日志里 `[TurboVLA] loaded N initialization tensors` —— 用真实 GroundingDINO ckpt
+  实测:**`load_bert: false` → 182 个**(2 投影 + 72 文本层 + 108 融合层,文本主干 211 张逐位未动);
+  **`load_bert: true` → 331 个,其中 149 个脉冲文本张量被覆盖(max|Δ| 达 2.05)** —— 半覆盖式静默
+  污染。启动后用 `python scripts/check_b_init_hash.py` 核验(需同一份 init ckpt)。
 - **A 臂**:`text.timesteps` 必须为 4(融合 ckpt 固定 T=4,否则加载即拒)。
 - 训练前可先跑构建自检(CPU 数分钟,能挡住配置类错误):
   `python scripts/gate2b_wrapper_build.py experiments/robotwin/configs/<arm>.yaml`
