@@ -80,6 +80,8 @@ class TurboVLADefaultConfig:
             "cross_attention_type": "ann",
             "cross_timesteps": 4,
             "cross_gradient_checkpointing": True,
+            # spike_sdsa weighting: "none" = SDSA coincidence counts, "softmax" variant.
+            "cross_attention_softmax": "none",
         }
     )
     initialization: dict = field(
@@ -189,6 +191,7 @@ class TurboVLAFramework(baseframework):
                 cross_attention_type=str(fw.interaction.get("cross_attention_type", "ann")),
                 cross_timesteps=int(fw.interaction.get("cross_timesteps", 4)),
                 cross_gradient_checkpointing=bool(fw.interaction.get("cross_gradient_checkpointing", True)),
+                cross_attention_softmax=str(fw.interaction.get("cross_attention_softmax", "none")),
             ),
             action=ActionHeadConfig(
                 action_dim=int(fw.action.action_dim),

@@ -307,6 +307,7 @@ class BiAttentionBlock(nn.Module):
         cross_attention_type="ann",
         cross_timesteps=4,
         cross_gradient_checkpointing=True,
+        cross_attention_softmax="none",
     ):
         """
         Inputs:
@@ -324,7 +325,11 @@ class BiAttentionBlock(nn.Module):
         if cross_attention_type == "spike_sdsa":
             from .spike_fusion import SpikeBiMultiHeadAttention
             attention_cls = SpikeBiMultiHeadAttention
-            extra = dict(timesteps=cross_timesteps, gradient_checkpointing=cross_gradient_checkpointing)
+            extra = dict(
+                timesteps=cross_timesteps,
+                gradient_checkpointing=cross_gradient_checkpointing,
+                softmax_mode=cross_attention_softmax,
+            )
         elif cross_attention_type == "ann":
             attention_cls, extra = BiMultiHeadAttention, {}
         else:

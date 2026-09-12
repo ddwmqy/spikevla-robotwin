@@ -42,6 +42,10 @@ framework:
     cross_attention_type: spike_sdsa
     cross_timesteps: 4
     cross_gradient_checkpointing: true
+    # 脉冲注意力的权重形式:"none" = SDSA 重合计数 + 计数缩放阈值(旧行为);
+    # "softmax" = 计数经 1/sqrt(d) 缩放后做 max-shift softmax(2026-09-12 用户指定)。
+    # 切换会改变 A 臂架构 → 属声明干预,切后须重跑 A 的验证(门 #1/#2b 与冒烟)。
+    cross_attention_softmax: softmax
     hidden_dim: 256
     nheads: 8
     dim_feedforward: 2048

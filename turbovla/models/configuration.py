@@ -57,6 +57,10 @@ class InteractionConfig:
     cross_attention_type: str = "ann"
     cross_timesteps: int = 4
     cross_gradient_checkpointing: bool = True
+    # Spike cross-attention weighting: "none" = coincidence counts against
+    # count-scaled LIF thresholds (the Meta-SpikeFormer-style SDSA formulation);
+    # "softmax" = max-shifted softmax over the scaled coincidence scores.
+    cross_attention_softmax: str = "none"
 
 
 @dataclass
@@ -131,6 +135,10 @@ class TurboVLAConfig:
             raise ValueError("interaction.cross_timesteps must be positive")
         if self.interaction.cross_attention_type == "spike_sdsa" and self.interaction.fusion_dropout != 0:
             raise ValueError("spike_sdsa requires fusion_dropout=0 to preserve binary spike operands")
+        if self.interaction.cross_attention_softmax not in {"none", "softmax"}:
+            raise ValueError("interaction.cross_attention_softmax must be none or softmax")
+        if self.interaction.cross_attention_softmax != "none" and self.interaction.cross_attention_type != "spike_sdsa":
+            raise ValueError("interaction.cross_attention_softmax applies only to cross_attention_type='spike_sdsa'")
         if self.interaction.compute_precision not in {"fp32", "bf16_autocast"}:
             raise ValueError("interaction.compute_precision must be fp32 or bf16_autocast")
         if self.action.action_dim < 1 or self.action.state_dim < 1 or self.action.horizon < 1:

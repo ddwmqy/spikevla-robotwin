@@ -60,6 +60,7 @@ class VisionLanguageInteraction(nn.Module):
             cross_attention_type=config.cross_attention_type,
             cross_timesteps=config.cross_timesteps,
             cross_gradient_checkpointing=config.cross_gradient_checkpointing,
+            cross_attention_softmax=config.cross_attention_softmax,
         )
         self.text_layers = _get_clones(text_layer, config.num_layers)
         self.fusion_layers = _get_clones(fusion_layer, config.num_layers)
