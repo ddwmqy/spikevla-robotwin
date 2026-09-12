@@ -50,8 +50,13 @@ CELLS = [
     ("ref", "highest", "fp32", "fp32", "sdpa"),
     ("official", None, "bf16_autocast", "bf16_autocast", "sdpa"),
     ("official_flash", None, "bf16_autocast", "bf16_autocast", "flash_attention_2"),
+    # NOTE: with interaction.compute_precision=bf16_autocast the outer autocast already covers
+    # the vision encoder, so `ann_bf16_vis_*` cells come out identical — the vision precision
+    # switch is only observable when the interaction autocast is off. That is what
+    # `ann_fp32_vis_bf16` measures; the earlier cells are kept to document the masking.
     ("ann_bf16_vis_fp32", None, "bf16_autocast", "fp32", "sdpa"),
     ("ann_bf16_vis_bf16", None, "bf16_autocast", "bf16", "sdpa"),
+    ("ann_fp32_vis_bf16", None, "fp32", "bf16_autocast", "sdpa"),
     ("fp32_matmul_high", "high", "fp32", "fp32", "sdpa"),
     ("fp32_matmul_medium", "medium", "fp32", "fp32", "sdpa"),
     ("bf16_matmul_highest", "highest", "bf16_autocast", "bf16_autocast", "sdpa"),
@@ -162,6 +167,22 @@ def stage_cell(args) -> None:
           f"condition{tuple(condition.shape)} actions{tuple(actions.shape)}")
 
 
+def _load_action_scales(stats_path):
+    """Per-dimension (max - min) from the dataset statistics: the min-max denormalization factor
+    for the 12 joint dims, used to express action error in raw (pre-normalization) units."""
+    if not stats_path or not Path(stats_path).is_file():
+        return None
+    stats = json.loads(Path(stats_path).read_text())
+    for key in ("new_embodiment", "robotwin50", "robotwin"):
+        node = stats.get(key) if isinstance(stats, dict) else None
+        if node and "action" in node:
+            a = node["action"]
+            import torch
+
+            return torch.tensor(a["max"], dtype=torch.float32) - torch.tensor(a["min"], dtype=torch.float32)
+    return None
+
+
 def stage_compare(args) -> None:
     import torch
 
@@ -169,7 +190,15 @@ def stage_compare(args) -> None:
     cell_files = {p.stem.replace("cell_", ""): p for p in sorted(out.glob("cell_*.pt"))}
     ref_name = args.ref
     ref = torch.load(cell_files[ref_name], map_location="cpu", weights_only=False)
-    meta = {"arm": args.arm, "reference_cell": ref_name, "input": str(out / "inputs.pt"), "cells": {}}
+    scale = _load_action_scales(args.stats)
+    meta = {
+        "arm": args.arm,
+        "reference_cell": ref_name,
+        "input": str(out / "inputs.pt"),
+        "stats": args.stats,
+        "action_scale_available": scale is not None,
+        "cells": {},
+    }
 
     rows = []
     for name, path in cell_files.items():
@@ -177,11 +206,21 @@ def stage_compare(args) -> None:
         entry = {"precision": cell["meta"]}
         for key in ("text_raw", "text_proj", "visual_proj", "condition", "actions"):
             d = (cell[key] - ref[key]).abs()
-            entry[key] = {"max_abs": d.max().item(), "mae": d.mean().item()}
+            rms = ref[key].pow(2).mean().sqrt().item()
+            entry[key] = {
+                "max_abs": d.max().item(),
+                "mae": d.mean().item(),
+                "ref_rms": rms,
+                "max_abs_rel": d.max().item() / rms if rms else None,
+            }
         act, ref_act = cell["actions"], ref["actions"]
         # joints = first 12 dims (min-max normalized), grippers = last 2 (binary decision)
         jd = (act[..., :12] - ref_act[..., :12]).abs()
         entry["joint"] = {"mae": jd.mean().item(), "max_abs": jd.max().item()}
+        if scale is not None:
+            entry["joint"]["mae_raw_units"] = (jd * scale[:12]).mean().item()
+            entry["joint"]["max_abs_raw_units"] = (jd * scale[:12]).max().item()
+            entry["joint"]["mean_scale"] = scale[:12].mean().item()
         g_cell, g_ref = act[..., 12:], ref_act[..., 12:]
         entry["gripper_raw_agreement_049"] = (g_cell >= 0.49).eq(g_ref >= 0.49).float().mean().item()
         entry["gripper_final_agreement_050"] = (
@@ -191,15 +230,20 @@ def stage_compare(args) -> None:
         rows.append((name, entry))
 
     (out / "report.json").write_text(json.dumps(meta, indent=2) + "\n")
-    hdr = f"{'cell':22s} {'text_raw':>10s} {'text_proj':>10s} {'visual':>10s} {'fusion':>10s} {'action':>10s} {'jointMAE':>9s} {'grip.49':>8s} {'grip.50':>8s}"
+    hdr = (f"{'cell':22s} {'txtProj':>8s} {'txtProj%':>8s} {'visual':>8s} {'visual%':>8s} "
+           f"{'fusion':>8s} {'action':>8s} {'jMAE':>8s} {'jMAEraw':>8s} {'grip.49':>8s}")
     print(hdr)
     print("-" * len(hdr))
     for name, e in rows:
-        print(f"{name:22s} {e['text_raw']['max_abs']:10.5f} {e['text_proj']['max_abs']:10.5f} "
-              f"{e['visual_proj']['max_abs']:10.5f} {e['condition']['max_abs']:10.5f} "
-              f"{e['actions']['max_abs']:10.5f} {e['joint']['mae']:9.5f} "
-              f"{e['gripper_raw_agreement_049']:8.4f} {e['gripper_final_agreement_050']:8.4f}")
-    print(f"\n(all values are deltas vs the `{ref_name}` reference, element-wise max|Δ| unless noted)")
+        raw = e["joint"].get("mae_raw_units")
+        print(f"{name:22s} {e['text_proj']['max_abs']:8.4f} {e['text_proj']['max_abs_rel']*100:7.2f}% "
+              f"{e['visual_proj']['max_abs']:8.4f} {e['visual_proj']['max_abs_rel']*100:7.2f}% "
+              f"{e['condition']['max_abs']:8.4f} {e['actions']['max_abs']:8.4f} "
+              f"{e['joint']['mae']:8.5f} {(f'{raw:8.4f}' if raw is not None else '       -')} "
+              f"{e['gripper_raw_agreement_049']:8.4f}")
+    print(f"\nmax|Δ| vs `{ref_name}`; '%' = max|Δ| / ref RMS; jMAEraw = joint MAE in raw (denormalized) units")
+    if scale is None:
+        print("(action_scale unavailable — pass --stats <dataset_statistics.json> for raw-unit errors)")
     print(f"report: {out / 'report.json'}")
 
 
@@ -210,6 +254,11 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--cell", default=DEFAULT_CELL)
     parser.add_argument("--ref", default="ref")
+    parser.add_argument(
+        "--stats",
+        default="/data/260010028/dwh_vla/v4_code/results/Checkpoints/asmoke_localdebug2_20260912/dataset_statistics.json",
+        help="dataset_statistics.json with action min/max, used to report joint error in raw units",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--set", action="append", default=[], help="extra override (with or without --)")
     args = parser.parse_args()
