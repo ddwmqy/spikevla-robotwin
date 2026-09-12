@@ -81,6 +81,19 @@ def install():
     base_train.VLATrainer.eval_action_model = _eval_action_model
     EMAVLATrainer._save_checkpoint = _save_checkpoint
 
+    # The dataloader calls `dist.get_rank()` unconditionally, which assumes a launcher
+    # (`accelerate launch --num_processes N`, as in scripts/robotwin/train.sh) has already
+    # initialized the process group. Standalone single-process runs must do it themselves.
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            init_method="tcp://127.0.0.1:29517",  # explicit: no MASTER_ADDR env without a launcher
+            rank=0,
+            world_size=1,
+        )
+
 
 def verify(run_dir: Path, args) -> dict:
     steps = [r["step"] for r in TRACE]
@@ -97,38 +110,53 @@ def verify(run_dir: Path, args) -> dict:
         failures.append(f"LR changed within a single optimizer step: {multi_lr}")
 
     # 2. Micro-batches per optimizer step == accumulation factor.
-    if not args.accum_is_one:
-        per_step = {s: steps.count(s) for s in distinct_steps}
-        expected = args.accum
-        bad = {s: c for s, c in per_step.items() if c != expected}
+    # Only interior steps carry a complete window: the run starts mid-window (so the first
+    # step value has accum-1 records) and stops right after the final sync (1 record).
+    if not args.accum_is_one and len(distinct_steps) > 2:
+        interior = distinct_steps[1:-1]
+        bad = {s: steps.count(s) for s in interior if steps.count(s) != args.accum}
         if bad:
-            failures.append(f"micro-batches per step != accum={expected}: {bad}")
+            failures.append(f"micro-batches per step != accum={args.accum}: {bad}")
 
-    # 3. Warmup peaks exactly at the boundary, in optimizer steps.
+    # 3. Warmup boundary, measured in optimizer steps.
+    #
+    # Semantics of `warmup_constant_with_factor`: `lr_lambda(s) = start + (1-start)*((s+1)/warmup)`
+    # for s < warmup, else 1.0, where s is the scheduler's last_epoch. Because the scheduler
+    # is stepped *after* `optimizer.step()`, the LR *used* at optimizer step k is f(k-1) — a
+    # clean ramp completing at step `warmup` — while the LR *recorded afterwards* for step k
+    # is f(k), which first reaches the full value at k = warmup - 1. So: recorded LR rises
+    # strictly up to `warmup - 1` and is constant from there on. (That one-step offset is the
+    # official schedule's own convention; §5.4 does not change it.)
     lr_by_step = {s: next(r["lr"] for r in TRACE if r["step"] == s) for s in distinct_steps}
-    peak_step = max(lr_by_step, key=lambda s: lr_by_step[s])
-    peak_lr = lr_by_step[peak_step]
+    peak_lr = max(lr_by_step.values())
+    peak_step = min(s for s, lr in lr_by_step.items() if lr == peak_lr)
     warm = args.warmup
-    if warm in lr_by_step:
-        if lr_by_step[warm] != peak_lr:
-            failures.append(f"LR at warmup step {warm} ({lr_by_step[warm]}) is not the peak ({peak_lr})")
-        if warm - 1 in lr_by_step and lr_by_step[warm - 1] >= peak_lr:
-            failures.append(f"LR did not increase into the warmup boundary: {lr_by_step[warm - 1]} -> {lr_by_step[warm]}")
-    elif peak_step < warm:
-        failures.append(f"run ended at step {peak_step} before the warmup boundary {warm}")
-    if peak_step > warm:
-        failures.append(f"LR kept rising past the warmup boundary: peak at step {peak_step}, expected {warm}")
+    boundary = max(1, warm - 1)
+    if boundary not in lr_by_step:
+        failures.append(f"run ended at step {max(distinct_steps)} before the warmup boundary {boundary}")
+    else:
+        if lr_by_step[boundary] != peak_lr:
+            failures.append(f"LR at warmup boundary step {boundary} ({lr_by_step[boundary]}) is not the peak ({peak_lr})")
+        prev = lr_by_step.get(boundary - 1)
+        if prev is not None and prev >= peak_lr:
+            failures.append(f"LR did not increase into the warmup boundary: {prev} -> {lr_by_step[boundary]}")
+        rising_after = [s for s in distinct_steps if s > peak_step and lr_by_step[s] != peak_lr]
+        if rising_after:
+            failures.append(f"LR did not stay constant after the warmup boundary: steps {rising_after[:5]}")
 
-    # 4. Gate firing counts.
-    expected_eval = len([s for s in distinct_steps if s % args.eval_interval == 0])
+    # 4. Gate firing counts. Step 0 is excluded for both gates: with the §5.4 guard a gate
+    # fires only on an update step, and no optimizer step has happened at step 0.
+    expected_eval = len([s for s in distinct_steps if s > 0 and s % args.eval_interval == 0])
     expected_save = len([s for s in distinct_steps if s > 0 and s % args.save_interval == 0])
     if COUNTS["eval"] != expected_eval:
         failures.append(f"eval fired {COUNTS['eval']}x, expected {expected_eval}")
     if COUNTS["save"] != expected_save:
         failures.append(f"save fired {COUNTS['save']}x, expected {expected_save}")
 
-    # 5. Checkpoints on disk match the save gate.
-    ckpts = sorted(p.name for p in (run_dir / "checkpoints").glob("steps_*_model.safetensors"))
+    # 5. Checkpoints on disk match the save gate (honour save_format: pt | safetensors).
+    ckpts = []
+    for pattern in ("steps_*_model.safetensors", "steps_*_pytorch_model.pt"):
+        ckpts += [p.name for p in (run_dir / "checkpoints").glob(pattern) if "_ema_" not in p.name]
     ckpt_steps = sorted({int(n.split("_")[1]) for n in ckpts})
     if ckpt_steps != [s for s in distinct_steps if s > 0 and s % args.save_interval == 0]:
         failures.append(f"checkpoint steps {ckpt_steps} do not match save gate multiples")
@@ -158,19 +186,39 @@ def main() -> None:
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--save-interval", type=int, default=200)
     parser.add_argument("--run-id", default=None, help="defaults to clean50_54verify_accum<N>_warm<W>")
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra OmegaConf dotlist override (repeatable), e.g. --set trainer.use_deepspeed=false",
+    )
     args = parser.parse_args()
     args.accum_is_one = args.accum == 1
+    # `run_id` has a single source of truth: the run dir is derived from it after training,
+    # so a stray `--set run_id=...` would make the post-run report look in the wrong place.
+    set_kv = {}
+    for item in args.set:
+        key, _, value = item.lstrip("-").partition("=")
+        set_kv[key.strip()] = value
+    if "run_id" in set_kv and args.run_id is None:
+        args.run_id = set_kv.pop("run_id")
+    args.set = [item for item in args.set if "run_id" not in item.lstrip("-").split("=")[0]]
     run_id = args.run_id or f"clean50_54verify_accum{args.accum}_warm{args.warmup}"
 
     install()
+    # Overrides MUST carry the `--` prefix: the recipe's `normalize_dotlist_args` silently
+    # drops any argument without it ("skip orphaned values"), so a bare `key=value` never
+    # reaches OmegaConf and the yaml value would win.
     overrides = [
-        f"run_id={run_id}",
-        f"trainer.max_train_steps={args.max_steps}",
-        f"trainer.num_warmup_steps={args.warmup}",
-        f"trainer.eval_interval={args.eval_interval}",
-        f"trainer.save_interval={args.save_interval}",
-        "trainer.logging_frequency=1",
-        f"trainer.gradient_accumulation_steps={args.accum}",
+        f"--run_id={run_id}",
+        f"--trainer.max_train_steps={args.max_steps}",
+        f"--trainer.num_warmup_steps={args.warmup}",
+        f"--trainer.eval_interval={args.eval_interval}",
+        f"--trainer.save_interval={args.save_interval}",
+        "--trainer.logging_frequency=1",
+        f"--trainer.gradient_accumulation_steps={args.accum}",
+        *[s if s.startswith("--") else f"--{s}" for s in args.set],
     ]
     sys.argv = [sys.argv[0], "--config_yaml", args.config_yaml, *overrides]
 
