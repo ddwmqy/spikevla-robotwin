@@ -74,10 +74,13 @@ bash scripts/robotwin/train.sh --trainer.save_interval 250 --trainer.eval_interv
 
 ## 3. 启动后必看的检查项
 
-- **B 臂**:日志里 `[TurboVLA] loaded N initialization tensors` —— 用真实 GroundingDINO ckpt
-  实测:**`load_bert: false` → 182 个**(2 投影 + 72 文本层 + 108 融合层,文本主干 211 张逐位未动);
-  **`load_bert: true` → 331 个,其中 149 个脉冲文本张量被覆盖(max|Δ| 达 2.05)** —— 半覆盖式静默
-  污染。启动后用 `python scripts/check_b_init_hash.py` 核验(需同一份 init ckpt)。
+- **日志核对 `[TurboVLA] loaded N initialization tensors`**(真实 GroundingDINO ckpt 实测):
+  | 臂 | 期望值 | 说明 |
+  |---|---|---|
+  | **C1** | **381** | 真 BERT(200)+ 投影(2)+ 文本层(72)+ 融合层(108)= 382,减 1 个形状不匹配 |
+  | **B** | **182** | 仅投影+文本层+融合层;**不含那 200 个普通 BERT 张量** |
+  B 若显示 331 → `load_bert` 没生效,sootspike 会被半覆盖(实测 149/211 张被改,max|Δ| 2.05)→ **立刻停**。
+  事后可复核:`python scripts/check_b_init_hash.py`(需同一份 init ckpt)。
 - **A 臂**:`text.timesteps` 必须为 4(融合 ckpt 固定 T=4,否则加载即拒)。
 - 训练前可先跑构建自检(CPU 数分钟,能挡住配置类错误):
   `python scripts/gate2b_wrapper_build.py experiments/robotwin/configs/<arm>.yaml`
