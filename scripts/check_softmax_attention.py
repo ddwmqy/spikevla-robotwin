@@ -73,7 +73,9 @@ def main() -> None:
         out_v, out_l = attn(v, l, mask_v, mask_l)
         assert torch.isfinite(out_v).all() and torch.isfinite(out_l).all(), f"{mode}: non-finite output"
         assert (out_l[1, 4:] == 0).all(), f"{mode}: padded text rows not zeroed"
-        out_v.sum().backward()
+        # Backprop both directions: the text-direction projections are not reachable from
+        # out_v alone, so a one-sided backward would leave them with no gradient tensor.
+        (out_v.sum() + out_l.sum()).backward()
         params = list(attn.parameters())
         # Structural assertion: every parameter must receive a gradient tensor. Whether an
         # individual tensor's gradient is exactly zero depends on the draw (a threshold can
